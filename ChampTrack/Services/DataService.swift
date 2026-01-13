@@ -26,15 +26,38 @@ class DataService: ObservableObject {
     var currentFamilyId: String? {
         didSet {
             if let familyId = currentFamilyId {
+                // Persist to UserDefaults
+                UserDefaults.standard.set(familyId, forKey: "familyId")
                 setupListeners(for: familyId)
             }
         }
     }
 
+    // Family code for sharing (shorter, more readable version of familyId)
+    var familyCode: String {
+        guard let familyId = currentFamilyId else { return "" }
+        // Use first 8 characters as a shareable code
+        return String(familyId.prefix(8)).uppercased()
+    }
+
     init() {
-        // For demo purposes, create a default family
-        // In production, this would be set after authentication
-        createOrJoinFamily(name: "My Family", userId: "demo-user")
+        // Check if we have a saved familyId
+        if let savedFamilyId = UserDefaults.standard.string(forKey: "familyId") {
+            // Verify the family exists and join it
+            self.currentFamilyId = savedFamilyId
+        } else {
+            // Create a new family for first-time users
+            createOrJoinFamily(name: "My Family", userId: getDeviceId())
+        }
+    }
+
+    private func getDeviceId() -> String {
+        if let deviceId = UserDefaults.standard.string(forKey: "deviceId") {
+            return deviceId
+        }
+        let newDeviceId = UUID().uuidString
+        UserDefaults.standard.set(newDeviceId, forKey: "deviceId")
+        return newDeviceId
     }
 
 
@@ -195,6 +218,59 @@ class DataService: ObservableObject {
                 self?.currentFamilyId = familyId
             }
         }
+    }
+
+    /// Join a family using a family code (first 8 chars of familyId)
+    func joinFamilyByCode(_ code: String, completion: @escaping (Bool, String?) -> Void) {
+        let searchCode = code.uppercased()
+
+        // Search for families where the ID starts with this code
+        db.collection("families").getDocuments { [weak self] snapshot, error in
+            guard let self = self else { return }
+
+            if let error = error {
+                completion(false, error.localizedDescription)
+                return
+            }
+
+            // Find family whose ID starts with the code
+            if let matchingDoc = snapshot?.documents.first(where: {
+                $0.documentID.uppercased().hasPrefix(searchCode)
+            }) {
+                let familyId = matchingDoc.documentID
+                let deviceId = self.getDeviceId()
+
+                // Add this device to the family members
+                self.db.collection("families").document(familyId).updateData([
+                    "members": FieldValue.arrayUnion([deviceId])
+                ]) { error in
+                    if let error = error {
+                        completion(false, error.localizedDescription)
+                    } else {
+                        self.currentFamilyId = familyId
+                        completion(true, nil)
+                    }
+                }
+            } else {
+                completion(false, "Family not found. Please check the code and try again.")
+            }
+        }
+    }
+
+    /// Leave current family and create a new one
+    func leaveFamily() {
+        UserDefaults.standard.removeObject(forKey: "familyId")
+        removeListeners()
+        family = nil
+        children = []
+        sports = []
+        classes = []
+        meals = []
+        goals = []
+        achievements = []
+
+        // Create a new family
+        createOrJoinFamily(name: "My Family", userId: getDeviceId())
     }
 
     // MARK: - Child Management

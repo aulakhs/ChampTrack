@@ -43,7 +43,7 @@ struct SettingsView: View {
                     }
 
                     NavigationLink(destination: FamilyMembersView()) {
-                        SettingsRow(icon: "person.3.fill", title: "Family Members", color: .energyGreen)
+                        SettingsRow(icon: "person.2.badge.gearshape.fill", title: "Family Sharing", color: .energyGreen)
                     }
                 }
 
@@ -217,19 +217,195 @@ struct ChangePasswordView: View {
 // MARK: - Family Members
 
 struct FamilyMembersView: View {
+    @EnvironmentObject var dataService: DataService
+    @State private var showJoinFamily = false
+    @State private var joinCode = ""
+    @State private var isJoining = false
+    @State private var errorMessage: String?
+    @State private var showError = false
+    @State private var showSuccess = false
+    @State private var showLeaveAlert = false
+
     var body: some View {
         List {
-            Section("Parents") {
-                Text("Parent management coming soon")
-                    .foregroundColor(.textSecondary)
+            // Family Code Section
+            Section {
+                VStack(alignment: .center, spacing: 12) {
+                    Text("Your Family Code")
+                        .font(.headline)
+                        .foregroundColor(.textPrimary)
+
+                    Text(dataService.familyCode)
+                        .font(.system(size: 32, weight: .bold, design: .monospaced))
+                        .foregroundColor(.championBlue)
+                        .padding()
+                        .background(Color.championBlue.opacity(0.1))
+                        .cornerRadius(12)
+
+                    Text("Share this code with family members\nso they can sync with your data")
+                        .font(.caption)
+                        .foregroundColor(.textSecondary)
+                        .multilineTextAlignment(.center)
+
+                    Button(action: copyCode) {
+                        Label("Copy Code", systemImage: "doc.on.doc")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.championBlue)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
             }
 
-            Section("Observers") {
-                Text("Invite grandparents or other family members")
-                    .foregroundColor(.textSecondary)
+            // Join Family Section
+            Section {
+                Button(action: { showJoinFamily = true }) {
+                    HStack {
+                        Image(systemName: "person.badge.plus")
+                            .foregroundColor(.energyGreen)
+                        Text("Join Another Family")
+                            .foregroundColor(.textPrimary)
+                    }
+                }
+            } footer: {
+                Text("If your spouse already set up the app, enter their family code to sync data.")
+            }
+
+            // Family Info
+            Section("Current Family") {
+                if let family = dataService.family {
+                    HStack {
+                        Text("Family Name")
+                            .foregroundColor(.textSecondary)
+                        Spacer()
+                        Text(family.name)
+                            .foregroundColor(.textPrimary)
+                    }
+
+                    HStack {
+                        Text("Members")
+                            .foregroundColor(.textSecondary)
+                        Spacer()
+                        Text("\(family.members.count)")
+                            .foregroundColor(.textPrimary)
+                    }
+                }
+            }
+
+            // Leave Family
+            Section {
+                Button(action: { showLeaveAlert = true }) {
+                    HStack {
+                        Image(systemName: "rectangle.portrait.and.arrow.right")
+                            .foregroundColor(.accentRed)
+                        Text("Leave Family & Start New")
+                            .foregroundColor(.accentRed)
+                    }
+                }
+            } footer: {
+                Text("This will disconnect you from the current family and create a new one. Your data will remain with the family you leave.")
             }
         }
-        .navigationTitle("Family Members")
+        .navigationTitle("Family Sharing")
+        .sheet(isPresented: $showJoinFamily) {
+            joinFamilySheet
+        }
+        .alert("Error", isPresented: $showError) {
+            Button("OK") {}
+        } message: {
+            Text(errorMessage ?? "An error occurred")
+        }
+        .alert("Success", isPresented: $showSuccess) {
+            Button("OK") {}
+        } message: {
+            Text("Successfully joined the family! Your data will now sync.")
+        }
+        .alert("Leave Family?", isPresented: $showLeaveAlert) {
+            Button("Cancel", role: .cancel) {}
+            Button("Leave", role: .destructive) {
+                dataService.leaveFamily()
+            }
+        } message: {
+            Text("Are you sure you want to leave this family? You'll start a new family and lose access to shared data.")
+        }
+    }
+
+    private var joinFamilySheet: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                Image(systemName: "person.2.circle.fill")
+                    .font(.system(size: 60))
+                    .foregroundColor(.championBlue)
+
+                Text("Join a Family")
+                    .font(.title2)
+                    .fontWeight(.bold)
+
+                Text("Enter the family code shared with you")
+                    .font(.subheadline)
+                    .foregroundColor(.textSecondary)
+
+                TextField("Family Code", text: $joinCode)
+                    .font(.system(size: 24, weight: .medium, design: .monospaced))
+                    .multilineTextAlignment(.center)
+                    .textInputAutocapitalization(.characters)
+                    .padding()
+                    .background(Color.gray.opacity(0.1))
+                    .cornerRadius(12)
+                    .padding(.horizontal)
+
+                Button(action: joinFamily) {
+                    HStack {
+                        if isJoining {
+                            ProgressView()
+                                .tint(.white)
+                        }
+                        Text(isJoining ? "Joining..." : "Join Family")
+                            .fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(joinCode.count >= 8 ? Color.championBlue : Color.gray)
+                    .foregroundColor(.white)
+                    .cornerRadius(12)
+                }
+                .disabled(joinCode.count < 8 || isJoining)
+                .padding(.horizontal)
+
+                Spacer()
+            }
+            .padding(.top, 40)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") {
+                        showJoinFamily = false
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+
+    private func copyCode() {
+        UIPasteboard.general.string = dataService.familyCode
+    }
+
+    private func joinFamily() {
+        isJoining = true
+        dataService.joinFamilyByCode(joinCode) { success, error in
+            isJoining = false
+            if success {
+                showJoinFamily = false
+                showSuccess = true
+                joinCode = ""
+            } else {
+                errorMessage = error
+                showError = true
+            }
+        }
     }
 }
 
