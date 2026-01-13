@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import FirebaseFirestore
 
 @MainActor
 class DataService: ObservableObject {
@@ -15,44 +16,242 @@ class DataService: ObservableObject {
     @Published var nutritionTargets: [String: NutritionTarget] = [:] // childId -> target
 
     @Published var isLoading = false
+    @Published var errorMessage: String?
+
+    // Firestore reference
+    private let db = Firestore.firestore()
+    private var listeners: [ListenerRegistration] = []
+
+    // Current family ID (set after login/family creation)
+    var currentFamilyId: String? {
+        didSet {
+            if let familyId = currentFamilyId {
+                setupListeners(for: familyId)
+            }
+        }
+    }
 
     init() {
-        loadMockData()
+        // For demo purposes, create a default family
+        // In production, this would be set after authentication
+        createOrJoinFamily(name: "My Family", userId: "demo-user")
+    }
+
+
+    // MARK: - Listener Management
+
+    private func removeListeners() {
+        listeners.forEach { $0.remove() }
+        listeners.removeAll()
+    }
+
+    private func setupListeners(for familyId: String) {
+        removeListeners()
+        isLoading = true
+
+        // Listen to family document
+        let familyListener = db.collection("families").document(familyId)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                if let error = error {
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+                if let data = snapshot?.data() {
+                    self.family = Family(
+                        id: familyId,
+                        name: data["name"] as? String ?? "",
+                        createdBy: data["createdBy"] as? String ?? "",
+                        members: data["members"] as? [String] ?? []
+                    )
+                }
+            }
+        listeners.append(familyListener)
+
+        // Listen to children
+        let childrenListener = db.collection("children")
+            .whereField("familyId", isEqualTo: familyId)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                if let error = error {
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+                self.children = snapshot?.documents.compactMap { doc in
+                    self.childFromDocument(doc)
+                } ?? []
+
+                // Calculate nutrition targets for all children
+                for child in self.children {
+                    self.calculateNutritionTarget(for: child)
+                }
+            }
+        listeners.append(childrenListener)
+
+        // Listen to sports
+        let sportsListener = db.collection("sports")
+            .whereField("familyId", isEqualTo: familyId)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                if let error = error {
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+                self.sports = snapshot?.documents.compactMap { doc in
+                    self.sportFromDocument(doc)
+                } ?? []
+            }
+        listeners.append(sportsListener)
+
+        // Listen to classes
+        let classesListener = db.collection("classes")
+            .whereField("familyId", isEqualTo: familyId)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                if let error = error {
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+                self.classes = snapshot?.documents.compactMap { doc in
+                    self.sportClassFromDocument(doc)
+                } ?? []
+                self.isLoading = false
+            }
+        listeners.append(classesListener)
+
+        // Listen to meals
+        let mealsListener = db.collection("meals")
+            .whereField("familyId", isEqualTo: familyId)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                if let error = error {
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+                self.meals = snapshot?.documents.compactMap { doc in
+                    self.mealFromDocument(doc)
+                } ?? []
+            }
+        listeners.append(mealsListener)
+
+        // Listen to goals
+        let goalsListener = db.collection("goals")
+            .whereField("familyId", isEqualTo: familyId)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                if let error = error {
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+                self.goals = snapshot?.documents.compactMap { doc in
+                    self.goalFromDocument(doc)
+                } ?? []
+            }
+        listeners.append(goalsListener)
+
+        // Listen to achievements
+        let achievementsListener = db.collection("achievements")
+            .whereField("familyId", isEqualTo: familyId)
+            .addSnapshotListener { [weak self] snapshot, error in
+                guard let self = self else { return }
+                if let error = error {
+                    self.errorMessage = error.localizedDescription
+                    return
+                }
+                self.achievements = snapshot?.documents.compactMap { doc in
+                    self.achievementFromDocument(doc)
+                } ?? []
+            }
+        listeners.append(achievementsListener)
     }
 
     // MARK: - Family Management
 
-    func createFamily(name: String, userId: String) {
-        let family = Family(
-            name: name,
-            createdBy: userId,
-            members: [userId]
-        )
-        self.family = family
+    func createOrJoinFamily(name: String, userId: String) {
+        let familyId = UUID().uuidString
+        let familyData: [String: Any] = [
+            "name": name,
+            "createdBy": userId,
+            "members": [userId],
+            "createdAt": Timestamp(date: Date())
+        ]
+
+        db.collection("families").document(familyId).setData(familyData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            } else {
+                self?.currentFamilyId = familyId
+            }
+        }
+    }
+
+    func joinFamily(familyId: String, userId: String) {
+        db.collection("families").document(familyId).updateData([
+            "members": FieldValue.arrayUnion([userId])
+        ]) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            } else {
+                self?.currentFamilyId = familyId
+            }
+        }
     }
 
     // MARK: - Child Management
 
     func addChild(_ child: Child) {
-        children.append(child)
-        generateAchievementsForChild(child)
-        calculateNutritionTarget(for: child)
+        guard let familyId = currentFamilyId else { return }
+
+        var childData = childToData(child)
+        childData["familyId"] = familyId
+
+        db.collection("children").document(child.id).setData(childData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            } else {
+                self?.generateAchievementsForChild(child)
+            }
+        }
     }
 
     func updateChild(_ child: Child) {
-        if let index = children.firstIndex(where: { $0.id == child.id }) {
-            children[index] = child
-            calculateNutritionTarget(for: child)
+        let childData = childToData(child)
+        db.collection("children").document(child.id).updateData(childData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            }
         }
     }
 
     func deleteChild(id: String) {
-        children.removeAll { $0.id == id }
-        sports.removeAll { $0.childId == id }
-        classes.removeAll { $0.childId == id }
-        meals.removeAll { $0.childId == id }
-        goals.removeAll { $0.childId == id }
-        achievements.removeAll { $0.childId == id }
+        // Delete child document
+        db.collection("children").document(id).delete()
+
+        // Delete related sports
+        db.collection("sports").whereField("childId", isEqualTo: id).getDocuments { [weak self] snapshot, _ in
+            snapshot?.documents.forEach { $0.reference.delete() }
+        }
+
+        // Delete related classes
+        db.collection("classes").whereField("childId", isEqualTo: id).getDocuments { snapshot, _ in
+            snapshot?.documents.forEach { $0.reference.delete() }
+        }
+
+        // Delete related meals
+        db.collection("meals").whereField("childId", isEqualTo: id).getDocuments { snapshot, _ in
+            snapshot?.documents.forEach { $0.reference.delete() }
+        }
+
+        // Delete related goals
+        db.collection("goals").whereField("childId", isEqualTo: id).getDocuments { snapshot, _ in
+            snapshot?.documents.forEach { $0.reference.delete() }
+        }
+
+        // Delete related achievements
+        db.collection("achievements").whereField("childId", isEqualTo: id).getDocuments { snapshot, _ in
+            snapshot?.documents.forEach { $0.reference.delete() }
+        }
+
         nutritionTargets.removeValue(forKey: id)
     }
 
@@ -63,18 +262,34 @@ class DataService: ObservableObject {
     // MARK: - Sports Management
 
     func addSport(_ sport: Sport) {
-        sports.append(sport)
+        guard let familyId = currentFamilyId else { return }
+
+        var sportData = sportToData(sport)
+        sportData["familyId"] = familyId
+
+        db.collection("sports").document(sport.id).setData(sportData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     func updateSport(_ sport: Sport) {
-        if let index = sports.firstIndex(where: { $0.id == sport.id }) {
-            sports[index] = sport
+        let sportData = sportToData(sport)
+        db.collection("sports").document(sport.id).updateData(sportData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            }
         }
     }
 
     func deleteSport(id: String) {
-        sports.removeAll { $0.id == id }
-        classes.removeAll { $0.sportId == id }
+        db.collection("sports").document(id).delete()
+
+        // Delete related classes
+        db.collection("classes").whereField("sportId", isEqualTo: id).getDocuments { snapshot, _ in
+            snapshot?.documents.forEach { $0.reference.delete() }
+        }
     }
 
     func getSports(for childId: String) -> [Sport] {
@@ -84,17 +299,29 @@ class DataService: ObservableObject {
     // MARK: - Class Management
 
     func addClass(_ sportClass: SportClass) {
-        classes.append(sportClass)
+        guard let familyId = currentFamilyId else { return }
+
+        var classData = sportClassToData(sportClass)
+        classData["familyId"] = familyId
+
+        db.collection("classes").document(sportClass.id).setData(classData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     func updateClass(_ sportClass: SportClass) {
-        if let index = classes.firstIndex(where: { $0.id == sportClass.id }) {
-            classes[index] = sportClass
+        let classData = sportClassToData(sportClass)
+        db.collection("classes").document(sportClass.id).updateData(classData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            }
         }
     }
 
     func deleteClass(id: String) {
-        classes.removeAll { $0.id == id }
+        db.collection("classes").document(id).delete()
     }
 
     func getClasses(for date: Date) -> [SportClass] {
@@ -116,16 +343,21 @@ class DataService: ObservableObject {
     }
 
     func assignTransportation(classId: String, dropoff: String?, pickup: String?) {
-        if let index = classes.firstIndex(where: { $0.id == classId }) {
-            classes[index].dropoffAssignedTo = dropoff
-            classes[index].pickupAssignedTo = pickup
+        var updates: [String: Any] = [:]
+        if let dropoff = dropoff {
+            updates["dropoffAssignedTo"] = dropoff
         }
+        if let pickup = pickup {
+            updates["pickupAssignedTo"] = pickup
+        }
+
+        db.collection("classes").document(classId).updateData(updates)
     }
 
     func markClassComplete(id: String) {
-        if let index = classes.firstIndex(where: { $0.id == id }) {
-            classes[index].status = .completed
-            let sportClass = classes[index]
+        db.collection("classes").document(id).updateData(["status": "completed"])
+
+        if let sportClass = classes.first(where: { $0.id == id }) {
             awardPointsForClass(sportClass)
         }
     }
@@ -133,18 +365,27 @@ class DataService: ObservableObject {
     // MARK: - Nutrition Management
 
     func addMeal(_ meal: Meal) {
-        meals.append(meal)
-        checkNutritionGoals(for: meal.childId, on: meal.date)
-    }
+        guard let familyId = currentFamilyId else { return }
 
-    func updateMeal(_ meal: Meal) {
-        if let index = meals.firstIndex(where: { $0.id == meal.id }) {
-            meals[index] = meal
+        var mealData = mealToData(meal)
+        mealData["familyId"] = familyId
+
+        db.collection("meals").document(meal.id).setData(mealData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            } else {
+                self?.checkNutritionGoals(for: meal.childId, on: meal.date)
+            }
         }
     }
 
+    func updateMeal(_ meal: Meal) {
+        let mealData = mealToData(meal)
+        db.collection("meals").document(meal.id).updateData(mealData)
+    }
+
     func deleteMeal(id: String) {
-        meals.removeAll { $0.id == id }
+        db.collection("meals").document(id).delete()
     }
 
     func getMeals(for childId: String, on date: Date) -> [Meal] {
@@ -184,17 +425,29 @@ class DataService: ObservableObject {
     // MARK: - Goals Management
 
     func addGoal(_ goal: Goal) {
-        goals.append(goal)
+        guard let familyId = currentFamilyId else { return }
+
+        var goalData = goalToData(goal)
+        goalData["familyId"] = familyId
+
+        db.collection("goals").document(goal.id).setData(goalData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     func updateGoal(_ goal: Goal) {
-        if let index = goals.firstIndex(where: { $0.id == goal.id }) {
-            goals[index] = goal
+        let goalData = goalToData(goal)
+        db.collection("goals").document(goal.id).updateData(goalData) { [weak self] error in
+            if let error = error {
+                self?.errorMessage = error.localizedDescription
+            }
         }
     }
 
     func deleteGoal(id: String) {
-        goals.removeAll { $0.id == id }
+        db.collection("goals").document(id).delete()
     }
 
     func getGoals(for childId: String) -> [Goal] {
@@ -206,21 +459,23 @@ class DataService: ObservableObject {
     }
 
     func completeGoal(id: String) {
-        if let index = goals.firstIndex(where: { $0.id == id }) {
-            goals[index].status = .completed
-            goals[index].currentValue = goals[index].targetValue
-
-            let goal = goals[index]
+        if let goal = goals.first(where: { $0.id == id }) {
+            db.collection("goals").document(id).updateData([
+                "status": "completed",
+                "currentValue": goal.targetValue
+            ])
             awardPointsForGoal(goal)
         }
     }
 
     func updateGoalProgress(id: String, newValue: Double) {
-        if let index = goals.firstIndex(where: { $0.id == id }) {
-            goals[index].currentValue = newValue
-            if goals[index].currentValue >= goals[index].targetValue {
-                completeGoal(id: id)
-            }
+        db.collection("goals").document(id).updateData([
+            "currentValue": newValue
+        ])
+
+        if let goal = goals.first(where: { $0.id == id }),
+           newValue >= goal.targetValue {
+            completeGoal(id: id)
         }
     }
 
@@ -235,13 +490,11 @@ class DataService: ObservableObject {
     }
 
     func unlockAchievement(id: String) {
-        if let index = achievements.firstIndex(where: { $0.id == id }) {
-            guard !achievements[index].isUnlocked else { return }
-
-            achievements[index].isUnlocked = true
-            achievements[index].earnedDate = Date()
-
-            let achievement = achievements[index]
+        if let achievement = achievements.first(where: { $0.id == id && !$0.isUnlocked }) {
+            db.collection("achievements").document(id).updateData([
+                "isUnlocked": true,
+                "earnedDate": Timestamp(date: Date())
+            ])
             awardPoints(to: achievement.childId, points: achievement.pointsAwarded)
         }
     }
@@ -249,27 +502,29 @@ class DataService: ObservableObject {
     // MARK: - Points Management
 
     func awardPoints(to childId: String, points: Int) {
-        if let index = children.firstIndex(where: { $0.id == childId }) {
-            children[index].totalPoints += points
-            updateLevel(for: childId)
+        if let child = children.first(where: { $0.id == childId }) {
+            let newPoints = child.totalPoints + points
+            let newLevel = calculateLevel(for: newPoints)
+
+            db.collection("children").document(childId).updateData([
+                "totalPoints": newPoints,
+                "currentLevel": newLevel
+            ])
+
             checkMilestoneAchievements(for: childId)
         }
     }
 
-    private func updateLevel(for childId: String) {
-        guard let index = children.firstIndex(where: { $0.id == childId }) else { return }
-
-        let points = children[index].totalPoints
+    private func calculateLevel(for points: Int) -> Int {
         let thresholds = [0, 100, 250, 500, 800, 1200, 1700, 2300, 3000, 3800, 4700, 5700, 6800, 8000, 9300, 10700, 12200, 13800, 15500, 17300]
 
-        var newLevel = 1
-        for (level, threshold) in thresholds.enumerated() {
+        var level = 1
+        for (index, threshold) in thresholds.enumerated() {
             if points >= threshold {
-                newLevel = level + 1
+                level = index + 1
             }
         }
-
-        children[index].currentLevel = newLevel
+        return level
     }
 
     // MARK: - Private Methods
@@ -287,18 +542,15 @@ class DataService: ObservableObject {
 
         let daily = getDailyNutrition(for: childId, on: date)
 
-        // Check if daily goals are met (within 10% tolerance)
         let caloriesMet = daily.calories >= target.calories * 0.9
         let proteinMet = daily.protein >= target.protein * 0.9
 
         if caloriesMet && proteinMet {
-            // Award daily nutrition goal points
             awardPoints(to: childId, points: 15)
         }
     }
 
     private func checkMilestoneAchievements(for childId: String) {
-        // Check point milestones
         if let child = getChild(id: childId) {
             if child.totalPoints >= 100 {
                 if let achievement = achievements.first(where: { $0.childId == childId && $0.title == "Century Club" && !$0.isUnlocked }) {
@@ -309,11 +561,17 @@ class DataService: ObservableObject {
     }
 
     private func generateAchievementsForChild(_ child: Child) {
+        guard let familyId = currentFamilyId else { return }
+
         let templates = Achievement.templates
         for template in templates {
             var achievement = template
             achievement.childId = child.id
-            achievements.append(achievement)
+
+            var achievementData = achievementToData(achievement)
+            achievementData["familyId"] = familyId
+
+            db.collection("achievements").document(achievement.id).setData(achievementData)
         }
     }
 
@@ -323,7 +581,6 @@ class DataService: ObservableObject {
         var conflicts: [ScheduleConflict] = []
         let dayClasses = getClasses(for: date)
 
-        // Check for child double-booking
         let childGroups = Dictionary(grouping: dayClasses, by: { $0.childId })
         for (childId, childClasses) in childGroups {
             let sorted = childClasses.sorted { $0.dateTime < $1.dateTime }
@@ -340,7 +597,6 @@ class DataService: ObservableObject {
             }
         }
 
-        // Check for unassigned transportation
         for sportClass in dayClasses {
             if sportClass.assignmentStatus == .unassigned {
                 conflicts.append(ScheduleConflict(
@@ -354,209 +610,326 @@ class DataService: ObservableObject {
         return conflicts
     }
 
-    // MARK: - Mock Data
+    // MARK: - Data Conversion Helpers
 
-    private func loadMockData() {
-        // Create mock family
-        let familyId = UUID().uuidString
-        family = Family(
-            id: familyId,
-            name: "Smith Family",
-            createdBy: "user1",
-            members: ["user1", "user2"]
+    private func childToData(_ child: Child) -> [String: Any] {
+        return [
+            "familyId": child.familyId,
+            "firstName": child.firstName,
+            "lastName": child.lastName,
+            "dateOfBirth": Timestamp(date: child.dateOfBirth),
+            "gender": child.gender.rawValue,
+            "weight": child.weight,
+            "height": child.height,
+            "photoURL": child.photoURL ?? "",
+            "allergies": child.allergies,
+            "schoolGrade": child.schoolGrade ?? "",
+            "totalPoints": child.totalPoints,
+            "currentLevel": child.currentLevel,
+            "createdAt": Timestamp(date: child.createdAt)
+        ]
+    }
+
+    private func childFromDocument(_ doc: DocumentSnapshot) -> Child? {
+        guard let data = doc.data() else { return nil }
+
+        return Child(
+            id: doc.documentID,
+            familyId: data["familyId"] as? String ?? "",
+            firstName: data["firstName"] as? String ?? "",
+            lastName: data["lastName"] as? String ?? "",
+            dateOfBirth: (data["dateOfBirth"] as? Timestamp)?.dateValue() ?? Date(),
+            gender: Gender(rawValue: data["gender"] as? String ?? "other") ?? .other,
+            weight: data["weight"] as? Double ?? 0,
+            height: data["height"] as? Double ?? 0,
+            photoURL: data["photoURL"] as? String,
+            allergies: data["allergies"] as? [String] ?? [],
+            schoolGrade: data["schoolGrade"] as? String,
+            totalPoints: data["totalPoints"] as? Int ?? 0,
+            currentLevel: data["currentLevel"] as? Int ?? 1,
+            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? Date()
         )
+    }
 
-        // Create mock children
-        let child1 = Child(
-            familyId: familyId,
-            firstName: "Emma",
-            lastName: "Smith",
-            dateOfBirth: Calendar.current.date(byAdding: .year, value: -10, to: Date())!,
-            gender: .female,
-            weight: 32,
-            height: 140,
-            totalPoints: 350,
-            currentLevel: 4
+    private func sportToData(_ sport: Sport) -> [String: Any] {
+        var data: [String: Any] = [
+            "childId": sport.childId,
+            "familyId": sport.familyId,
+            "sportName": sport.sportName,
+            "colorHex": sport.colorHex,
+            "iconName": sport.iconName,
+            "isActive": sport.isActive,
+            "createdAt": Timestamp(date: sport.createdAt)
+        ]
+
+        if let teamName = sport.teamName { data["teamName"] = teamName }
+        if let coachName = sport.coachName { data["coachName"] = coachName }
+        if let coachContact = sport.coachContact { data["coachContact"] = coachContact }
+        if let seasonStart = sport.seasonStart { data["seasonStart"] = Timestamp(date: seasonStart) }
+        if let seasonEnd = sport.seasonEnd { data["seasonEnd"] = Timestamp(date: seasonEnd) }
+        if let location = sport.location { data["location"] = location }
+
+        return data
+    }
+
+    private func sportFromDocument(_ doc: DocumentSnapshot) -> Sport? {
+        guard let data = doc.data() else { return nil }
+
+        return Sport(
+            id: doc.documentID,
+            childId: data["childId"] as? String ?? "",
+            familyId: data["familyId"] as? String ?? "",
+            sportName: data["sportName"] as? String ?? "",
+            teamName: data["teamName"] as? String,
+            coachName: data["coachName"] as? String,
+            coachContact: data["coachContact"] as? String,
+            seasonStart: (data["seasonStart"] as? Timestamp)?.dateValue(),
+            seasonEnd: (data["seasonEnd"] as? Timestamp)?.dateValue(),
+            location: data["location"] as? String,
+            colorHex: data["colorHex"] as? String ?? "4A90E2",
+            iconName: data["iconName"] as? String ?? "sportscourt.fill",
+            isActive: data["isActive"] as? Bool ?? true,
+            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? Date()
         )
+    }
 
-        let child2 = Child(
-            familyId: familyId,
-            firstName: "Jake",
-            lastName: "Smith",
-            dateOfBirth: Calendar.current.date(byAdding: .year, value: -8, to: Date())!,
-            gender: .male,
-            weight: 28,
-            height: 125,
-            totalPoints: 180,
-            currentLevel: 2
-        )
+    private func sportClassToData(_ sportClass: SportClass) -> [String: Any] {
+        var data: [String: Any] = [
+            "sportId": sportClass.sportId,
+            "childId": sportClass.childId,
+            "familyId": sportClass.familyId,
+            "type": sportClass.type.rawValue,
+            "dateTime": Timestamp(date: sportClass.dateTime),
+            "duration": sportClass.duration,
+            "recurringFrequency": sportClass.recurringFrequency.rawValue,
+            "equipmentNeeded": sportClass.equipmentNeeded,
+            "status": sportClass.status.rawValue,
+            "createdAt": Timestamp(date: sportClass.createdAt)
+        ]
 
-        children = [child1, child2]
+        if let location = sportClass.location {
+            data["location"] = ["name": location.name, "address": location.address ?? ""]
+        }
+        if let recurringUntil = sportClass.recurringUntil {
+            data["recurringUntil"] = Timestamp(date: recurringUntil)
+        }
+        if let dropoff = sportClass.dropoffAssignedTo { data["dropoffAssignedTo"] = dropoff }
+        if let pickup = sportClass.pickupAssignedTo { data["pickupAssignedTo"] = pickup }
+        if let notes = sportClass.notes { data["notes"] = notes }
 
-        // Generate achievements for children
-        for child in children {
-            generateAchievementsForChild(child)
-            calculateNutritionTarget(for: child)
+        return data
+    }
+
+    private func sportClassFromDocument(_ doc: DocumentSnapshot) -> SportClass? {
+        guard let data = doc.data() else { return nil }
+
+        var location: Location? = nil
+        if let locationData = data["location"] as? [String: Any] {
+            location = Location(
+                name: locationData["name"] as? String ?? "",
+                address: locationData["address"] as? String
+            )
         }
 
-        // Unlock some achievements for demo
-        if let achievement = achievements.first(where: { $0.childId == child1.id && $0.title == "First Goal" }) {
-            var updated = achievement
-            updated.isUnlocked = true
-            updated.earnedDate = Calendar.current.date(byAdding: .day, value: -5, to: Date())
-            if let index = achievements.firstIndex(where: { $0.id == achievement.id }) {
-                achievements[index] = updated
-            }
-        }
-
-        // Create mock sports
-        let soccer = Sport(
-            childId: child1.id,
-            familyId: familyId,
-            sportName: "Soccer",
-            teamName: "Lightning Strikers",
-            coachName: "Coach Williams",
-            coachContact: "555-1234",
-            location: "City Sports Complex",
-            colorHex: Sport.sportColors["Soccer"]!,
-            iconName: Sport.sportIcons["Soccer"]!
+        return SportClass(
+            id: doc.documentID,
+            sportId: data["sportId"] as? String ?? "",
+            childId: data["childId"] as? String ?? "",
+            familyId: data["familyId"] as? String ?? "",
+            type: ClassType(rawValue: data["type"] as? String ?? "practice") ?? .practice,
+            dateTime: (data["dateTime"] as? Timestamp)?.dateValue() ?? Date(),
+            duration: data["duration"] as? Int ?? 60,
+            location: location,
+            recurringFrequency: RecurringFrequency(rawValue: data["recurringFrequency"] as? String ?? "none") ?? .none,
+            recurringUntil: (data["recurringUntil"] as? Timestamp)?.dateValue(),
+            dropoffAssignedTo: data["dropoffAssignedTo"] as? String,
+            pickupAssignedTo: data["pickupAssignedTo"] as? String,
+            notes: data["notes"] as? String,
+            equipmentNeeded: data["equipmentNeeded"] as? [String] ?? [],
+            status: ClassStatus(rawValue: data["status"] as? String ?? "scheduled") ?? .scheduled,
+            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? Date()
         )
+    }
 
-        let swimming = Sport(
-            childId: child1.id,
-            familyId: familyId,
-            sportName: "Swimming",
-            teamName: "Dolphins Swim Club",
-            coachName: "Coach Miller",
-            location: "Community Pool",
-            colorHex: Sport.sportColors["Swimming"]!,
-            iconName: Sport.sportIcons["Swimming"]!
-        )
-
-        let basketball = Sport(
-            childId: child2.id,
-            familyId: familyId,
-            sportName: "Basketball",
-            teamName: "Junior Hawks",
-            coachName: "Coach Johnson",
-            location: "Elementary School Gym",
-            colorHex: Sport.sportColors["Basketball"]!,
-            iconName: Sport.sportIcons["Basketball"]!
-        )
-
-        sports = [soccer, swimming, basketball]
-
-        // Create mock classes for the next week
-        let calendar = Calendar.current
-        var mockClasses: [SportClass] = []
-
-        // Soccer practice tomorrow
-        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: Date()) {
-            let practiceTime = calendar.date(bySettingHour: 16, minute: 0, second: 0, of: tomorrow)!
-            mockClasses.append(SportClass(
-                sportId: soccer.id,
-                childId: child1.id,
-                familyId: familyId,
-                type: .practice,
-                dateTime: practiceTime,
-                duration: 90,
-                location: Location(name: "City Sports Complex", address: "123 Sports Ave"),
-                dropoffAssignedTo: "user1",
-                pickupAssignedTo: "user2"
-            ))
-        }
-
-        // Swimming in 2 days
-        if let dayAfter = calendar.date(byAdding: .day, value: 2, to: Date()) {
-            let swimTime = calendar.date(bySettingHour: 17, minute: 30, second: 0, of: dayAfter)!
-            mockClasses.append(SportClass(
-                sportId: swimming.id,
-                childId: child1.id,
-                familyId: familyId,
-                type: .training,
-                dateTime: swimTime,
-                duration: 60,
-                location: Location(name: "Community Pool", address: "456 Pool Lane"),
-                dropoffAssignedTo: "user1"
-            ))
-        }
-
-        // Basketball game in 3 days
-        if let in3Days = calendar.date(byAdding: .day, value: 3, to: Date()) {
-            let gameTime = calendar.date(bySettingHour: 10, minute: 0, second: 0, of: in3Days)!
-            mockClasses.append(SportClass(
-                sportId: basketball.id,
-                childId: child2.id,
-                familyId: familyId,
-                type: .game,
-                dateTime: gameTime,
-                duration: 60,
-                location: Location(name: "Elementary School Gym", address: "789 School St")
-            ))
-        }
-
-        classes = mockClasses
-
-        // Create mock goals
-        let goal1 = Goal(
-            childId: child1.id,
-            familyId: familyId,
-            type: .sports,
-            title: "Score 5 Goals",
-            description: "Score 5 goals during soccer games this season",
-            targetValue: 5,
-            currentValue: 3,
-            unit: "goals",
-            endDate: calendar.date(byAdding: .month, value: 2, to: Date())!,
-            priority: .high,
-            relatedSportId: soccer.id,
-            pointsReward: 150
-        )
-
-        let goal2 = Goal(
-            childId: child1.id,
-            familyId: familyId,
-            type: .attendance,
-            title: "Perfect Attendance",
-            description: "Attend all swim practices this month",
-            targetValue: 8,
-            currentValue: 5,
-            unit: "sessions",
-            endDate: calendar.date(byAdding: .month, value: 1, to: Date())!,
-            priority: .medium,
-            relatedSportId: swimming.id,
-            pointsReward: 100
-        )
-
-        let goal3 = Goal(
-            childId: child2.id,
-            familyId: familyId,
-            type: .nutrition,
-            title: "Hydration Hero",
-            description: "Drink 6 glasses of water every day for a week",
-            targetValue: 7,
-            currentValue: 4,
-            unit: "days",
-            endDate: calendar.date(byAdding: .day, value: 10, to: Date())!,
-            priority: .medium,
-            pointsReward: 75
-        )
-
-        goals = [goal1, goal2, goal3]
-
-        // Create mock meals for today
-        let todayBreakfast = Meal(
-            childId: child1.id,
-            date: Date(),
-            mealType: .breakfast,
-            foods: [
-                FoodItem(name: "Oatmeal", calories: 150, protein: 5, carbs: 27, fats: 3),
-                FoodItem(name: "Banana", calories: 105, protein: 1, carbs: 27, fats: 0),
-                FoodItem(name: "Milk", calories: 100, protein: 8, carbs: 12, fats: 2)
+    private func mealToData(_ meal: Meal) -> [String: Any] {
+        let foodsData = meal.foods.map { food -> [String: Any] in
+            var foodDict: [String: Any] = [
+                "id": food.id,
+                "name": food.name,
+                "calories": food.calories,
+                "protein": food.protein,
+                "carbs": food.carbs,
+                "fats": food.fats,
+                "portion": food.portion
             ]
-        )
+            if let portionGrams = food.portionGrams {
+                foodDict["portionGrams"] = portionGrams
+            }
+            return foodDict
+        }
 
-        meals = [todayBreakfast]
+        var data: [String: Any] = [
+            "childId": meal.childId,
+            "date": Timestamp(date: meal.date),
+            "mealType": meal.mealType.rawValue,
+            "photoURLs": meal.photoURLs,
+            "foods": foodsData,
+            "createdAt": Timestamp(date: meal.createdAt)
+        ]
+        if let notes = meal.notes { data["notes"] = notes }
+
+        return data
+    }
+
+    private func mealFromDocument(_ doc: DocumentSnapshot) -> Meal? {
+        guard let data = doc.data() else { return nil }
+
+        let foodsData = data["foods"] as? [[String: Any]] ?? []
+        let foods = foodsData.map { foodData -> FoodItem in
+            FoodItem(
+                id: foodData["id"] as? String ?? UUID().uuidString,
+                name: foodData["name"] as? String ?? "",
+                calories: foodData["calories"] as? Double ?? 0,
+                protein: foodData["protein"] as? Double ?? 0,
+                carbs: foodData["carbs"] as? Double ?? 0,
+                fats: foodData["fats"] as? Double ?? 0,
+                portion: foodData["portion"] as? String ?? "1 serving",
+                portionGrams: foodData["portionGrams"] as? Double
+            )
+        }
+
+        return Meal(
+            id: doc.documentID,
+            childId: data["childId"] as? String ?? "",
+            date: (data["date"] as? Timestamp)?.dateValue() ?? Date(),
+            mealType: MealType(rawValue: data["mealType"] as? String ?? "snack") ?? .snack,
+            photoURLs: data["photoURLs"] as? [String] ?? [],
+            foods: foods,
+            notes: data["notes"] as? String,
+            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? Date()
+        )
+    }
+
+    private func goalToData(_ goal: Goal) -> [String: Any] {
+        let milestonesData = goal.milestones.map { milestone -> [String: Any] in
+            var data: [String: Any] = [
+                "id": milestone.id,
+                "title": milestone.title,
+                "targetValue": milestone.targetValue,
+                "isCompleted": milestone.isCompleted
+            ]
+            if let completedAt = milestone.completedAt {
+                data["completedAt"] = Timestamp(date: completedAt)
+            }
+            return data
+        }
+
+        var data: [String: Any] = [
+            "childId": goal.childId,
+            "familyId": goal.familyId,
+            "type": goal.type.rawValue,
+            "title": goal.title,
+            "targetValue": goal.targetValue,
+            "currentValue": goal.currentValue,
+            "unit": goal.unit,
+            "startDate": Timestamp(date: goal.startDate),
+            "endDate": Timestamp(date: goal.endDate),
+            "status": goal.status.rawValue,
+            "priority": goal.priority.rawValue,
+            "milestones": milestonesData,
+            "pointsReward": goal.pointsReward,
+            "createdAt": Timestamp(date: goal.createdAt)
+        ]
+
+        if let description = goal.description { data["description"] = description }
+        if let relatedSportId = goal.relatedSportId { data["relatedSportId"] = relatedSportId }
+        if let parentNotes = goal.parentNotes { data["parentNotes"] = parentNotes }
+        if let childNotes = goal.childNotes { data["childNotes"] = childNotes }
+
+        return data
+    }
+
+    private func goalFromDocument(_ doc: DocumentSnapshot) -> Goal? {
+        guard let data = doc.data() else { return nil }
+
+        let milestonesData = data["milestones"] as? [[String: Any]] ?? []
+        let milestones = milestonesData.map { milestoneData -> Milestone in
+            Milestone(
+                id: milestoneData["id"] as? String ?? UUID().uuidString,
+                title: milestoneData["title"] as? String ?? "",
+                targetValue: milestoneData["targetValue"] as? Double ?? 0,
+                isCompleted: milestoneData["isCompleted"] as? Bool ?? false,
+                completedAt: (milestoneData["completedAt"] as? Timestamp)?.dateValue()
+            )
+        }
+
+        return Goal(
+            id: doc.documentID,
+            childId: data["childId"] as? String ?? "",
+            familyId: data["familyId"] as? String ?? "",
+            type: GoalType(rawValue: data["type"] as? String ?? "personal") ?? .personal,
+            title: data["title"] as? String ?? "",
+            description: data["description"] as? String,
+            targetValue: data["targetValue"] as? Double ?? 0,
+            currentValue: data["currentValue"] as? Double ?? 0,
+            unit: data["unit"] as? String ?? "",
+            startDate: (data["startDate"] as? Timestamp)?.dateValue() ?? Date(),
+            endDate: (data["endDate"] as? Timestamp)?.dateValue() ?? Date(),
+            status: GoalStatus(rawValue: data["status"] as? String ?? "active") ?? .active,
+            priority: GoalPriority(rawValue: data["priority"] as? String ?? "medium") ?? .medium,
+            relatedSportId: data["relatedSportId"] as? String,
+            parentNotes: data["parentNotes"] as? String,
+            childNotes: data["childNotes"] as? String,
+            milestones: milestones,
+            pointsReward: data["pointsReward"] as? Int ?? 100,
+            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? Date()
+        )
+    }
+
+    private func achievementToData(_ achievement: Achievement) -> [String: Any] {
+        var data: [String: Any] = [
+            "childId": achievement.childId,
+            "type": achievement.type.rawValue,
+            "category": achievement.category.rawValue,
+            "title": achievement.title,
+            "description": achievement.description,
+            "iconName": achievement.iconName,
+            "tier": achievement.tier.rawValue,
+            "pointsAwarded": achievement.pointsAwarded,
+            "isUnlocked": achievement.isUnlocked,
+            "createdAt": Timestamp(date: achievement.createdAt)
+        ]
+
+        if let earnedDate = achievement.earnedDate {
+            data["earnedDate"] = Timestamp(date: earnedDate)
+        }
+        if let progress = achievement.progress { data["progress"] = progress }
+        if let requirement = achievement.requirement { data["requirement"] = requirement }
+        if let relatedGoalId = achievement.relatedGoalId { data["relatedGoalId"] = relatedGoalId }
+
+        return data
+    }
+
+    private func achievementFromDocument(_ doc: DocumentSnapshot) -> Achievement? {
+        guard let data = doc.data() else { return nil }
+
+        return Achievement(
+            id: doc.documentID,
+            childId: data["childId"] as? String ?? "",
+            type: AchievementType(rawValue: data["type"] as? String ?? "badge") ?? .badge,
+            category: AchievementCategory(rawValue: data["category"] as? String ?? "milestone") ?? .milestone,
+            title: data["title"] as? String ?? "",
+            description: data["description"] as? String ?? "",
+            iconName: data["iconName"] as? String ?? "star.fill",
+            tier: AchievementTier(rawValue: data["tier"] as? String ?? "bronze") ?? .bronze,
+            pointsAwarded: data["pointsAwarded"] as? Int ?? 0,
+            earnedDate: (data["earnedDate"] as? Timestamp)?.dateValue(),
+            relatedGoalId: data["relatedGoalId"] as? String,
+            isUnlocked: data["isUnlocked"] as? Bool ?? false,
+            progress: data["progress"] as? Double,
+            requirement: data["requirement"] as? Double,
+            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? Date()
+        )
     }
 }
 
