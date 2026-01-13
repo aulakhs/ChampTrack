@@ -67,11 +67,6 @@ xcodegen generate
 open ChampTrack.xcodeproj
 ```
 
-### Running on Simulator
-
-1. Select a simulator from the device dropdown (e.g., iPhone 15)
-2. Press `Cmd + R` or click the Play button
-
 ### Running on Physical Device
 
 To install ChampTrack on your iPhone:
@@ -167,34 +162,8 @@ ChampTrack follows the **MVVM (Model-View-ViewModel)** architecture pattern:
 
 ### Data Layer
 
-Currently uses mock data via `DataService` for demonstration. The architecture is designed to easily integrate with:
-- Firebase Firestore
-- Core Data
-- CloudKit
-- Any REST API
+Firebase Firestore
 
-## Design System
-
-### Colors
-
-| Color | Hex | Usage |
-|-------|-----|-------|
-| Champion Blue | `#4A90E2` | Primary actions, links |
-| Victory Gold | `#F5A623` | Points, rewards |
-| Energy Green | `#7ED321` | Success, health |
-| Accent Purple | `#9B59B6` | Achievements |
-| Accent Red | `#E74C3C` | Alerts, warnings |
-| Soft Background | `#F8F9FA` | Page backgrounds |
-| Text Primary | `#2C3E50` | Main text |
-| Text Secondary | `#7F8C8D` | Secondary text |
-
-### Typography
-
-Uses system fonts with the following hierarchy:
-- **Title**: Large titles for headers
-- **Headline**: Section headers
-- **Body**: Main content
-- **Caption**: Secondary information
 
 ## Configuration
 
@@ -206,20 +175,6 @@ The default bundle identifier is `com.champtrack.app`. To change it:
 2. Update the `PRODUCT_BUNDLE_IDENTIFIER` setting
 3. Regenerate the project with `xcodegen generate`
 
-### App Icon
-
-Add your app icon to `ChampTrack/Assets.xcassets/AppIcon.appiconset/`
-
-## Future Enhancements
-
-- [ ] Firebase integration for cloud sync
-- [ ] Push notifications for reminders
-- [ ] Apple Watch companion app
-- [ ] Family sharing and multi-user support
-- [ ] Export data to PDF/CSV
-- [ ] Dark mode support
-- [ ] Widgets for quick stats
-- [ ] Siri shortcuts integration
 
 ## Contributing
 
